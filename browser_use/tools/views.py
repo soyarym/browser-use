@@ -13,6 +13,17 @@ class GoToUrlAction(BaseModel):
 	new_tab: bool = False  # True to open in new tab, False to navigate in current tab
 
 
+class ClickIframeButtonAction(BaseModel):
+    iframe_selector: str | None = None
+    button_selector: str
+
+
+# Pydantic model
+class IframeInteractAction(BaseModel):
+    iframe_selector: str
+    actions: list[dict]  # e.g. [{"click": "button:has-text('Continue')"}, {"check": "<css>"}, {"click": "<css>"}]
+
+
 class ClickElementAction(BaseModel):
 	index: int = Field(ge=1, description='index of the element to click')
 	while_holding_ctrl: bool = Field(

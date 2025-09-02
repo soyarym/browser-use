@@ -1771,6 +1771,8 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		converted_actions = []
 		action_model = self.ActionModel
 		for action_dict in actions:
+			# TODO Delete after debugging
+			print("DEBUG RAW ACTION:", action_dict)
 			# Each action_dict should have a single key-value pair
 			action_name = next(iter(action_dict))
 			params = action_dict[action_name]

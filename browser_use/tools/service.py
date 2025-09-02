@@ -1,9 +1,13 @@
 import asyncio
 import enum
+import inspect # TODO remove after debugging
 import json
 import logging
 import os
+import re
+import time
 from typing import Generic, TypeVar
+from urllib.parse import urlparse
 
 try:
 	from lmnr import Laminar  # type: ignore
@@ -38,6 +42,8 @@ from browser_use.tools.views import (
 	CloseTabAction,
 	DoneAction,
 	GetDropdownOptionsAction,
+	ClickIframeButtonAction,
+	IframeInteractAction,
 	GoToUrlAction,
 	InputTextAction,
 	NoParamsAction,
@@ -50,6 +56,15 @@ from browser_use.tools.views import (
 	UploadFileAction,
 )
 from browser_use.utils import _log_pretty_url, time_execution_sync
+
+# Module-level store for persisted iframe sessions:
+# key = (session_id_or_unique, iframe_selector) -> iframe_session_id (CDP session id)
+_PERSISTED_IFRAME_SESSIONS: dict = {}
+
+logging.basicConfig(
+    level=logging.DEBUG,  # show INFO messages and above
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +244,496 @@ class Tools(Generic[Context]):
 				else:
 					# Return error in ActionResult instead of re-raising
 					return ActionResult(error=f'Navigation failed: {clean_msg}')
+
+
+		@self.registry.action(
+			"Click an element inside a visible iframe using LLM-provided CSS (dynamic).",
+			param_model=ClickIframeButtonAction
+		)
+		async def click_iframe_button(
+			browser_session: BrowserSession,
+			iframe_selector: str | None = None,
+			button_selector: str | None = None
+		):
+			"""
+			Click an element inside an iframe using dynamic detection and CDP Runtime.evaluate.
+
+			Important behavior:
+			- Detects largest visible iframe if iframe_selector is None or generic 'iframe'
+			- Attaches to the iframe target dynamically
+			- Uses Target.setAutoAttach + event handlers to detect popup windows created by the click
+			- Uses a robust click technique for checkboxes (pointer/mouse events, then set checked + dispatch input/change)
+			- Waits for popup to navigate away from about:blank (with logging)
+			"""
+			import asyncio
+			import time
+			from urllib.parse import urlparse
+
+			logger.info("Starting dynamic click_iframe_button (instrumented)")
+
+			if not browser_session.agent_focus:
+				raise RuntimeError("No active agent_focus CDPSession")
+			if not button_selector or not isinstance(button_selector, str):
+				raise RuntimeError("button_selector is required and must be a string")
+
+			session = browser_session.agent_focus
+			cdp = session.cdp_client.send
+			client = session.cdp_client  # used for registering events
+			logger.info("Agent session id=%s", getattr(session, "session_id", None))
+			logger.info("CDP client url=%s", getattr(session.cdp_client, "url", None))
+
+			# -----------------------
+			# 1) Enumerate targets & attach to page target
+			# -----------------------
+			targets = await cdp.Target.getTargets()
+			tinfos = targets.get("targetInfos", []) or []
+			logger.info("Found %d targets", len(tinfos))
+			for t in tinfos:
+				logger.info("Target id=%s type=%s url=%s", t.get("targetId"), t.get("type"), t.get("url"))
+
+			page_target = next((t for t in tinfos if t.get("type") == "page"), None)
+			if not page_target:
+				raise RuntimeError("No page target found")
+			logger.info("Using page target id=%s url=%s", page_target["targetId"], page_target.get("url"))
+
+			attach_page = await cdp.Target.attachToTarget({
+				"targetId": page_target["targetId"],
+				"flatten": True
+			})
+			page_session_id = attach_page["sessionId"]
+			logger.info("Attached to page session id=%s", page_session_id)
+
+			try:
+				await cdp.Page.enable({}, session_id=page_session_id)
+				logger.info("Page domain enabled on page session")
+			except Exception as e:
+				logger.warning("Page.enable failed (continuing): %s", e)
+
+			# Enable catching popups automatically (so targetCreated events are delivered & auto-attached)
+			try:
+				await cdp.Target.setAutoAttach({
+					"autoAttach": True,
+					"waitForDebuggerOnStart": False,
+					"flatten": True
+				}, session_id=page_session_id)
+				logger.info("Target.setAutoAttach(enabled) called")
+			except Exception as e:
+				logger.warning("Target.setAutoAttach failed or not required: %s", e)
+
+			# -----------------------
+			# 2) Find candidate iframe src via runtime evaluate on page
+			# -----------------------
+			selected_iframe_src = None
+			if iframe_selector and iframe_selector.strip().lower() != "iframe":
+				logger.info("Specific iframe selector provided: %s", iframe_selector)
+				try:
+					sel_eval = await cdp.Runtime.evaluate({
+						"expression": f"(document.querySelector({repr(iframe_selector)}) || {{}}).src || null",
+						"returnByValue": True
+					}, session_id=page_session_id)
+					selected_iframe_src = sel_eval.get("result", {}).get("value")
+					logger.info("Resolved iframe src (from selector): %s", selected_iframe_src)
+				except Exception as e:
+					logger.warning("Failed to resolve iframe selector src: %s", e)
+					selected_iframe_src = None
+			else:
+				logger.info("No specific iframe selector or generic 'iframe'; will auto-detect largest visible iframe")
+				visible_iframes_js = """
+				(() => {
+					const toInfo = (f) => {
+						const r = f.getBoundingClientRect();
+						const cs = window.getComputedStyle(f);
+						const area = Math.max(0, r.width) * Math.max(0, r.height);
+						return { src: f.src || null, rect: {x:r.x, y:r.y, width:r.width, height:r.height}, area, visible: area>0 && cs.display!=='none' && cs.visibility!=='hidden' && cs.opacity !== '0' };
+					};
+					return Array.from(document.querySelectorAll('iframe')).map(toInfo).sort((a,b)=>b.area-a.area);
+				})()
+				"""
+				vis_eval = await cdp.Runtime.evaluate({
+					"expression": visible_iframes_js,
+					"returnByValue": True
+				}, session_id=page_session_id)
+				frames_info = vis_eval.get("result", {}).get("value", []) or []
+				logger.info("Detected %d iframes on page (sorted by area desc)", len(frames_info))
+				for i, fi in enumerate(frames_info):
+					logger.info("Iframe[%d]: src=%s area=%s visible=%s rect=%s", i, fi.get("src"), fi.get("area"), fi.get("visible"), fi.get("rect"))
+				candidate = next((fi for fi in frames_info if fi.get("visible")), None) or (frames_info[0] if frames_info else None)
+				selected_iframe_src = candidate.get("src") if candidate else None
+				logger.info("Auto-selected iframe src: %s", selected_iframe_src)
+
+			# -----------------------
+			# 3) Match selected_iframe_src -> CDP iframe target (fall back to largest iframe target)
+			# -----------------------
+			selected_iframe_target = None
+
+			def normalize_url(u: str) -> str:
+				if not u:
+					return ""
+				p = urlparse(u.strip())
+				return f"{p.scheme}://{p.netloc}{p.path}"
+
+			if selected_iframe_src:
+				target_url = normalize_url(selected_iframe_src)
+				for t in tinfos:
+					if t.get("type") != "iframe":
+						continue
+					if normalize_url(t.get("url", "")) == target_url:
+						selected_iframe_target = t
+						break
+				if not selected_iframe_target:
+					# best-effort: startswith match (strip query/hash)
+					for t in tinfos:
+						if t.get("type") != "iframe":
+							continue
+						u = t.get("url", "") or ""
+						if u.startswith(selected_iframe_src.split("?")[0].split("#")[0]):
+							selected_iframe_target = t
+							break
+
+			if not selected_iframe_target:
+				# fallback: pick largest iframe target from CDP list
+				iframe_targets = [t for t in tinfos if t.get("type") == "iframe"]
+				if not iframe_targets:
+					raise RuntimeError("No iframe targets found in CDP")
+				# choose based on outerWidth/outerHeight if present, else first
+				def area_of_t(t):
+					return (t.get("outerWidth')") or 0) * (t.get("outerHeight')") or 0) if False else 0
+				selected_iframe_target = iframe_targets[0]
+				logger.info("Fallback: selected first iframe target id=%s url=%s", selected_iframe_target["targetId"], selected_iframe_target.get("url"))
+
+			logger.info("Matched iframe target id=%s url=%s", selected_iframe_target["targetId"], selected_iframe_target.get("url"))
+
+			# -----------------------
+			# 4) Register CDP event handlers to detect popup windows (targetCreated / infoChanged)
+			# -----------------------
+			popup_future = asyncio.get_event_loop().create_future()
+
+			def _safe_log_event(prefix, payload):
+				try:
+					logger.info("[CDP EVENT] %s %s", prefix, payload)
+				except Exception:
+					logger.exception("Failed to log CDP event")
+
+			def on_target_created(params):
+				ti = params.get("targetInfo", params)
+				_safe_log_event("Target.targetCreated", ti)
+				# If this page was opened by our iframe target, mark popup
+				# match by openerId or openerFrameId referencing our iframe target
+				opener_id = ti.get("openerId") or ti.get("openerId")
+				opener_frame = ti.get("openerFrameId")
+				if opener_id == selected_iframe_target.get("targetId") or opener_frame == selected_iframe_target.get("targetId"):
+					if not popup_future.done():
+						popup_future.set_result(ti)
+
+			def on_target_info_changed(params):
+				ti = params.get("targetInfo", params)
+				_safe_log_event("Target.targetInfoChanged", ti)
+				# if we already got a popup and its url changed from blank, resolve it too
+				if not popup_future.done():
+					# match by openerId or by target id if it appears
+					opener_id = ti.get("openerId")
+					if opener_id == selected_iframe_target.get("targetId"):
+						popup_future.set_result(ti)
+
+			# Register using client.register (your runtime logs show you used 'client.register.*' earlier)
+			try:
+				client.register("Target.targetCreated", on_target_created)
+				client.register("Target.targetInfoChanged", on_target_info_changed)
+				client.register("Target.attachedToTarget", lambda p: _safe_log_event("Target.attachedToTarget", p))
+				client.register("Target.detachedFromTarget", lambda p: _safe_log_event("Target.detachedFromTarget", p))
+				logger.info("Registered CDP event handlers via client.register.*")
+			except Exception as e:
+				logger.warning("client.register not available or failed: %s", e)
+				# continue — handlers are best-effort
+
+			# -----------------------
+			# 5) Attach to the iframe target and evaluate click JS inside it
+			# -----------------------
+			attach_iframe = await cdp.Target.attachToTarget({
+				"targetId": selected_iframe_target["targetId"],
+				"flatten": True
+			})
+			iframe_session_id = attach_iframe["sessionId"]
+			logger.info("Attached to iframe session id=%s (targetId=%s)", iframe_session_id, selected_iframe_target["targetId"])
+
+			# Try to enable Page/Runtime in iframe session for extra visibility
+			try:
+				await cdp.Page.enable({}, session_id=iframe_session_id)
+				await cdp.Runtime.enable({}, session_id=iframe_session_id)
+			except Exception as e:
+				logger.debug("Enabling Page/Runtime in iframe session failed (non-fatal): %s", e)
+
+			# Robust click JS: dispatch pointer/mouse events to better mimic real user, then fallback to set checked + input/change
+			click_js = f"""
+			(() => {{
+				const sel = {repr(button_selector)};
+				const el = document.querySelector(sel);
+				if (!el) {{
+					throw new Error("Element not found: " + sel);
+				}}
+				try {{ el.focus && el.focus(); }} catch(e){{/* ignore */}}
+				// dispatch pointer/mouse sequence
+				const mouse = (type) => el.dispatchEvent(new MouseEvent(type, {{view: window, bubbles: true, cancelable: true}}));
+				try {{ mouse('pointerdown'); mouse('mousedown'); mouse('mouseup'); mouse('click'); }} catch(e){{/* ignore */}}
+				// If checkbox and still not checked, set it + dispatch input/change
+				try {{
+					if (el.type === 'checkbox' && !el.checked) {{
+						el.checked = true;
+						el.dispatchEvent(new Event('input', {{bubbles:true}}));
+						el.dispatchEvent(new Event('change', {{bubbles:true}}));
+					}}
+				}} catch(e){{/* ignore */}}
+				const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : {{x:0,y:0,width:0,height:0}};
+				return {{ clicked: true, selector: sel, tag: el.tagName, rect: {{x: rect.x, y: rect.y, w: rect.width, h: rect.height}}, checked: el.checked }};
+			}})()
+			"""
+
+			logger.info("Attempting click inside iframe. selector=%s", button_selector)
+			try:
+				click_eval = await cdp.Runtime.evaluate({
+					"expression": click_js,
+					"awaitPromise": True,
+					"returnByValue": True
+				}, session_id=iframe_session_id)
+				raw_val = click_eval.get("result", {})
+				logger.info("Raw Runtime.evaluate click response: %s", raw_val)
+			except Exception as e:
+				logger.exception("Click evaluation failed")
+				raise
+
+			# After click: poll checkbox state a few times to detect instability (and log it)
+			if "checkbox" in button_selector or button_selector.strip().startswith("input[type"):
+				poll_attempts = 8
+				for attempt in range(poll_attempts):
+					try:
+						state_eval = await cdp.Runtime.evaluate({
+							"expression": f"(function(){{const el=document.querySelector({repr(button_selector)}); return el ? {{checked: el.checked, outer: el.outerHTML}} : null; }})()",
+							"returnByValue": True
+						}, session_id=iframe_session_id)
+						s = state_eval.get("result", {}).get("value")
+						logger.info("Checkbox debug after click (attempt %d): %s", attempt, s)
+						# if checkbox is checked and stable for one attempt, break
+						if s and s.get("checked"):
+							# short wait to see if it flips back
+							await asyncio.sleep(0.18)
+							verify = await cdp.Runtime.evaluate({
+								"expression": f"(function(){{const el=document.querySelector({repr(button_selector)}); return el ? el.checked : null; }})()",
+								"returnByValue": True
+							}, session_id=iframe_session_id)
+							v = verify.get("result", {}).get("value")
+							logger.info("Checkbox verify (attempt %d) => %s", attempt, v)
+							if v:
+								logger.info("Checkbox appears set and stable (attempt %d)", attempt)
+								break
+						await asyncio.sleep(0.12)
+					except Exception as e:
+						logger.debug("Error while polling checkbox state: %s", e)
+						await asyncio.sleep(0.12)
+
+			# -----------------------
+			# 6) Wait for popup (targetCreated) that was opened by the iframe (if any)
+			# -----------------------
+			# If no popup created, popup_future times out below and we continue
+			popup_info = None
+			try:
+				logger.info("Checking for popup window after click...")
+				popup_info = await asyncio.wait_for(popup_future, timeout=5.0)
+				logger.info("Popup target created: %s", popup_info)
+			except asyncio.TimeoutError:
+				logger.warning("No popup window detected within timeout after click.")
+				popup_info = None
+
+			# If popup was created, try to attach and wait for navigation to non-empty url
+			if popup_info:
+				popup_target_id = popup_info.get("targetId")
+				try:
+					logger.info("Attaching to popup target id=%s", popup_target_id)
+					attach_popup = await cdp.Target.attachToTarget({
+						"targetId": popup_target_id,
+						"flatten": True
+					})
+					popup_session_id = attach_popup["sessionId"]
+					logger.info("Attached to popup session id=%s", popup_session_id)
+					try:
+						await cdp.Page.enable({}, session_id=popup_session_id)
+						await cdp.Runtime.enable({}, session_id=popup_session_id)
+					except Exception as e:
+						logger.debug("Failed to enable Page/Runtime on popup session: %s", e)
+
+					# Poll for a real URL (not blank / about:blank)
+					max_poll = 30
+					popup_url = None
+					for i in range(max_poll):
+						try:
+							# try Target.getTargetInfo? simpler: ask runtime for location.href
+							eval_res = await cdp.Runtime.evaluate({
+								"expression": "window.location.href",
+								"returnByValue": True
+							}, session_id=popup_session_id)
+							popup_url = eval_res.get("result", {}).get("value")
+						except Exception as e:
+							logger.debug("Runtime.evaluate(window.location.href) failed on popup (try %d): %s", i, e)
+							popup_url = None
+
+						logger.info("Popup poll %d/%d: url=%s", i+1, max_poll, popup_url)
+						if popup_url and popup_url not in ("", "about:blank"):
+							logger.info("Popup navigated to: %s", popup_url)
+							break
+						await asyncio.sleep(0.2)
+					else:
+						logger.warning("Popup did not navigate to a non-blank URL within poll window; popup_info=%s", popup_info)
+				except Exception as e:
+					logger.exception("Failed to attach to popup target or poll popup URL: %s", e)
+
+			# Done - keep return type simple (None) so agent doesn't reject result type
+			logger.info("click_iframe_button finished (returning None).")
+			return None
+
+		
+
+		# @self.registry.action(
+		# 	"Interact with elements inside a specific iframe (sequence of steps).",
+		# 	param_model=IframeInteractAction
+		# )
+		# async def iframe_interact(browser_session: BrowserSession, iframe_selector: str, actions: list[dict], timeout: float = 10.0):
+		# 	"""
+		# 	Interact with elements inside a target iframe using CDP Runtime.evaluate.
+		# 	Supports click, click_text, and check sequentially. Persists iframe CDP session across calls.
+
+		# 	Waits for the iframe to appear as a CDP target before attaching, to handle dynamically loaded cross-domain iframes.
+		# 	"""
+
+		# 	if not browser_session.agent_focus:
+		# 		raise RuntimeError("No active agent_focus CDPSession")
+
+		# 	cdp = browser_session.agent_focus.cdp_client.send
+		# 	session_identity = getattr(browser_session.agent_focus, "session_id", id(browser_session.agent_focus))
+
+		# 	# ----------------- Helper: wait for iframe target -----------------
+		# 	async def wait_for_iframe_target(timeout: float = 10.0) -> dict:
+		# 		start = time.time()
+		# 		while time.time() - start < timeout:
+		# 			targets = await cdp.Target.getTargets()
+		# 			for t in targets.get("targetInfos", []):
+		# 				if t.get("type") != "iframe":
+		# 					continue
+		# 				url = t.get("url") or ""
+		# 				if iframe_selector in url:
+		# 					logger.info("Matched iframe target url=%s", url)
+		# 					return t
+		# 			await asyncio.sleep(0.1)
+		# 		raise RuntimeError(f"Iframe target not found for selector: {iframe_selector!r} within {timeout}s")
+
+		# 	# ----------------- Helper: attach to iframe -----------------
+		# 	async def attach_to_iframe(target: dict) -> str:
+		# 		attach_result = await cdp.Target.attachToTarget({
+		# 			"targetId": target["targetId"],
+		# 			"flatten": True
+		# 		})
+		# 		sid = attach_result["sessionId"]
+		# 		_PERSISTED_IFRAME_SESSIONS[(session_identity, iframe_selector)] = sid
+		# 		logger.info("Attached to iframe target id=%s -> session %s", target["targetId"], sid)
+		# 		return sid
+
+		# 	# ----------------- Helper: get iframe session -----------------
+		# 	async def get_iframe_session() -> str:
+		# 		key = (session_identity, iframe_selector)
+		# 		sid = _PERSISTED_IFRAME_SESSIONS.get(key)
+		# 		if sid:
+		# 			return sid
+		# 		target = await wait_for_iframe_target(timeout=timeout)
+		# 		return await attach_to_iframe(target)
+
+		# 	# ----------------- Helper: evaluate JS in iframe -----------------
+		# 	async def eval_in_iframe(expression: str) -> dict:
+		# 		sid = await get_iframe_session()
+		# 		try:
+		# 			return await cdp.Runtime.evaluate({
+		# 				"expression": expression,
+		# 				"awaitPromise": True,
+		# 				"returnByValue": True
+		# 			}, session_id=sid)
+		# 		except Exception as e:
+		# 			logger.warning("Runtime.evaluate failed on session %s: %s. Reattaching.", sid, e)
+		# 			# Reattach once
+		# 			target = await wait_for_iframe_target(timeout=timeout)
+		# 			sid = await attach_to_iframe(target)
+		# 			return await cdp.Runtime.evaluate({
+		# 				"expression": expression,
+		# 				"awaitPromise": True,
+		# 				"returnByValue": True
+		# 			}, session_id=sid)
+
+		# 	# ----------------- JS helpers for actions -----------------
+		# 	def js_escape(s: str) -> str:
+		# 		return s.replace("\\", "\\\\").replace("`", "\\`")
+
+		# 	async def step_click_text(text: str):
+		# 		t = js_escape(text)
+		# 		js = f"""
+		# 		(function() {{
+		# 			const candidates = Array.from(document.querySelectorAll('button, [role="button"], a'));
+		# 			const el = candidates.find(e => (e.textContent || '').trim() === `{t}`);
+		# 			if (!el) throw new Error("Clickable element with exact text not found: {t}");
+		# 			el.click();
+		# 			return "clicked_by_text: {t}";
+		# 		}})()
+		# 		"""
+		# 		return await eval_in_iframe(js)
+
+		# 	async def step_click_css(selector: str):
+		# 		sel = js_escape(selector)
+		# 		js = f"""
+		# 		(function() {{
+		# 			const el = document.querySelector(`{sel}`);
+		# 			if (!el) throw new Error("Click target not found: {sel}");
+		# 			el.click();
+		# 			return "clicked: {sel}";
+		# 		}})()
+		# 		"""
+		# 		return await eval_in_iframe(js)
+
+		# 	async def step_check(selector: str):
+		# 		sel = js_escape(selector)
+		# 		js = f"""
+		# 		(function() {{
+		# 			const root = document.querySelector(`{sel}`);
+		# 			if (!root) throw new Error("Checkbox root not found: {sel}");
+		# 			const cb = root.matches && root.matches('input[type="checkbox"]') ? root : root.querySelector('input[type="checkbox"]');
+		# 			if (!cb) throw new Error("Checkbox input not found under: {sel}");
+		# 			if (!cb.checked) cb.click();
+		# 			return "checked: {sel}";
+		# 		}})()
+		# 		"""
+		# 		return await eval_in_iframe(js)
+
+		# 	# ----------------- Run actions sequentially -----------------
+		# 	results = []
+		# 	for idx, step in enumerate(actions):
+		# 		try:
+		# 			logger.info("Running step %s: %s", idx, step)
+		# 			if "click" in step:
+		# 				selector = step["click"]
+		# 				# Detect text-based pseudo selectors
+		# 				m = re.search(r":has-text\\((['\"]?)(.*?)\\1\\)", selector) or re.search(r":contains\\((['\"]?)(.*?)\\1\\)", selector)
+		# 				if m:
+		# 					res = await step_click_text(m.group(2))
+		# 				elif selector.startswith("text="):
+		# 					res = await step_click_text(selector.split("text=", 1)[1])
+		# 				else:
+		# 					res = await step_click_css(selector)
+		# 			elif "click_text" in step:
+		# 				res = await step_click_text(step["click_text"])
+		# 			elif "check" in step:
+		# 				res = await step_check(step["check"])
+		# 			else:
+		# 				raise ValueError(f"Unknown step: {step}")
+		# 			results.append(res.get("result", {}).get("value"))
+		# 		except Exception as e:
+		# 			logger.exception("Action step %s failed: %s", idx, e)
+		# 			raise
+		# 	return results
+
 
 		@self.registry.action('Go back', param_model=NoParamsAction)
 		async def go_back(_: NoParamsAction, browser_session: BrowserSession):
